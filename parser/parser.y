@@ -1,4 +1,4 @@
-%{
+﻿%{
 // Copyright 2013 The ql Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSES/QL-LICENSE file.
@@ -38,6 +38,7 @@ import (
 
 %}
 
+// 定义所有token中用到的所有类型
 %union {
 	offset int // offset
 	item interface{}
@@ -46,6 +47,8 @@ import (
 	statement ast.StmtNode
 }
 
+// 定义特殊符号，并且告知goyacc这类符号的类型，这里是ident类型
+// 这类符号代表了SQL的关键字
 %token	<ident>
 	/*yy:token "%c"     */	identifier      "identifier"
 	/*yy:token "_%c"    */  underscoreCS	"UNDERSCORE_CHARSET"
@@ -686,6 +689,7 @@ import (
 
 %token not2
 
+// 为非终结符指定类型
 %type	<expr>
 	Expression			"expression"
 	BoolPri				"boolean primary expression"
@@ -811,6 +815,7 @@ import (
 	InsertValues			"Rest part of INSERT/REPLACE INTO statement"
 	JoinTable 			"join table"
 	JoinType			"join type"
+	JoinSpecification	"join specification"
 	LocationLabelList		"location label name list"
 	LikeEscapeOpt 			"like escape option"
 	LikeTableWithOrWithoutParen	"LIKE table_name or ( LIKE table_name )"
@@ -963,6 +968,7 @@ import (
 	FunctionNameDateArithMultiForms	"Date arith function call names (adddate or subdate)"
 	VariableName			"A simple Identifier like xx or the xx.xx form"
 
+// 定义优先级
 %precedence empty
 
 %precedence sqlBufferResult
@@ -1025,6 +1031,9 @@ import (
 %start	Start
 
 %%
+
+// 规则定义，可以参考MySQL的语法定义 - BNF语法
+// 左部可以认为是非终结符，右部就是对应的动作（action）
 
 Start:
 	StatementList
@@ -3805,11 +3814,28 @@ IndexHintListOpt:
 
 JoinTable:
 	/* Use %prec to evaluate production TableRef before cross join */
+	// 这是一种Join的SQL语法表示，参考https://dev.mysql.com/doc/refman/5.7/en/join.html
 	TableRef CrossOpt TableRef %prec tableRefPriority
 	{
+		// $1 => TableRef
+		// $3 => TableRef
+		// $$ designates the top of the stack after reduction has taken place. 简单说就是规约后的值
 		$$ = &ast.Join{Left: $1.(ast.ResultSetNode), Right: $3.(ast.ResultSetNode), Tp: ast.CrossJoin}
 	}
-	/* Your code here. */
+|	TableRef JoinType OuterOpt "JOIN" TableRef JoinSpecification
+	{
+		$$ = &ast.Join{Left: $1.(ast.ResultSetNode), Right: $5.(ast.ResultSetNode), Tp: $2.(ast.JoinType), On: $6.(*ast.Join).On}
+	}
+|	TableRef CrossOpt TableRef JoinSpecification
+	{
+		$$ = &ast.Join{Left: $1.(ast.ResultSetNode), Right: $3.(ast.ResultSetNode), Tp: ast.CrossJoin, On: $4.(*ast.Join).On}
+	}
+
+JoinSpecification:
+	"ON" Expression
+	{
+		$$ = &ast.Join{On: &ast.OnCondition{Expr: $2}}
+	}
 
 JoinType:
 	"LEFT"
@@ -3828,6 +3854,7 @@ OuterOpt:
 CrossOpt:
 	"JOIN"
 |	"INNER" "JOIN"
+|	"CROSS"	"JOIN"
 
 
 LimitClause:
