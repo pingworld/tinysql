@@ -62,6 +62,7 @@ func appendTableRecordPrefix(buf []byte, tableID int64) []byte {
 }
 
 // EncodeRowKeyWithHandle encodes the table id, row handle into a kv.Key
+// t[tableID]_r[handle]
 func EncodeRowKeyWithHandle(tableID int64, handle int64) kv.Key {
 	buf := make([]byte, 0, RecordRowKeyLen)
 	buf = appendTableRecordPrefix(buf, tableID)
@@ -69,10 +70,56 @@ func EncodeRowKeyWithHandle(tableID int64, handle int64) kv.Key {
 	return buf
 }
 
+// decodePrefix decode prefix like "t[tableID]_?" which _? might be "_r" or "_i".
+func decodePrefix(buf []byte, prefixSep []byte) (tableID int64, err error) {
+	if len(buf) <= prefixLen {
+		return 0, errors.New("insufficient bytes to decode prefix")
+	}
+
+	decCursorB, decCursorE := 0, tablePrefixLength
+	prefix := buf[decCursorB:decCursorE]
+	if !bytes.Equal(prefix, TablePrefix()) {
+		return 0, errors.New("invalid prefix")
+	}
+
+	decCursorB, decCursorE = decCursorE, decCursorE+idLen
+	_, tableID, err = codec.DecodeInt(buf[decCursorB:decCursorE])
+	if err != nil {
+		return 0, err
+	}
+
+	decCursorB, decCursorE = decCursorE, decCursorE+len(prefixSep)
+	sep := buf[decCursorB:decCursorE]
+	if !bytes.Equal(sep, prefixSep) {
+		return 0, errors.New("invalid prefix sep")
+	}
+
+	return tableID, nil
+}
+
+// decodeTableRecordPrefix decode tableID from "t[tableID]_r".
+func decodeTableRecordPrefix(buf []byte) (tableID int64, err error) {
+	return decodePrefix(buf, recordPrefixSep)
+}
+
 // DecodeRecordKey decodes the key and gets the tableID, handle.
 func DecodeRecordKey(key kv.Key) (tableID int64, handle int64, err error) {
 	/* Your code here */
-	return
+	if len(key) < RecordRowKeyLen {
+		return 0, 0, errors.New("insufficient bytes to decode key")
+	}
+
+	tableID, err = decodeTableRecordPrefix(key)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	_, handle, err = codec.DecodeInt(key[prefixLen:RecordRowKeyLen])
+	if err != nil {
+		return 0, 0, err
+	}
+
+	return tableID, handle, nil
 }
 
 // appendTableIndexPrefix appends table index prefix  "t[tableID]_i".
@@ -84,6 +131,7 @@ func appendTableIndexPrefix(buf []byte, tableID int64) []byte {
 }
 
 // EncodeIndexSeekKey encodes an index value to kv.Key.
+// t[tableID]_i[idxID][encodedValue]
 func EncodeIndexSeekKey(tableID int64, idxID int64, encodedValue []byte) kv.Key {
 	key := make([]byte, 0, prefixLen+idLen+len(encodedValue))
 	key = appendTableIndexPrefix(key, tableID)
@@ -92,10 +140,26 @@ func EncodeIndexSeekKey(tableID int64, idxID int64, encodedValue []byte) kv.Key 
 	return key
 }
 
+// decodeTableIndexPrefix decode tableID from "t[tableID]_i".
+func decodeTableIndexPrefix(buf []byte) (tableID int64, err error) {
+	return decodePrefix(buf, indexPrefixSep)
+}
+
 // DecodeIndexKeyPrefix decodes the key and gets the tableID, indexID, indexValues.
 func DecodeIndexKeyPrefix(key kv.Key) (tableID int64, indexID int64, indexValues []byte, err error) {
 	/* Your code here */
-	return tableID, indexID, indexValues, nil
+	if len(key) < prefixLen {
+		return 0, 0, nil, errors.New("insufficient bytes to decode index")
+	}
+
+	tableID, err = decodeTableIndexPrefix(key)
+	if err != nil {
+		return 0, 0, nil, err
+	}
+
+	indexValues, indexID, err = codec.DecodeInt(key[prefixLen:])
+
+	return tableID, indexID, indexValues, err
 }
 
 // DecodeIndexKey decodes the key and gets the tableID, indexID, indexValues.
