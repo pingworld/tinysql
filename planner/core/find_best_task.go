@@ -1,4 +1,4 @@
-// Copyright 2017 PingCAP, Inc.
+﻿// Copyright 2017 PingCAP, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,6 +14,7 @@
 package core
 
 import (
+	"fmt"
 	"math"
 
 	"github.com/pingcap/tidb/expression"
@@ -204,15 +205,106 @@ type candidatePath struct {
 	isMatchProp  bool
 }
 
+func (c *candidatePath) ToString() string {
+	return fmt.Sprintf("path:%v, columnSet:%v, isSingleScan:%v, isMatchProp:%v", c.path.ToString(), c.columnSet,
+		c.isSingleScan, c.isMatchProp)
+}
+
+func ifSetOfColumnsInTheAccessCondition(lcs, rcs *intsets.Sparse) (int, bool) {
+	lLen, rLen := lcs.Len(), rcs.Len()
+	if lLen < rLen {
+		// -1 is meaningful only when l.SubsetOf(r) is true.
+		return -1, lcs.SubsetOf(rcs)
+	}
+	if lLen == rLen {
+		// 0 is meaningful only when l.SubsetOf(r) is true.
+		return 0, lcs.SubsetOf(rcs)
+	}
+	// 1 is meaningful only when r.SubsetOf(l) is true.
+	return 1, rcs.SubsetOf(lcs)
+}
+
+// isMatchProp is more better than notMatchProp
+// return 1 if lmp is more better than rmp
+// return 0 if lmp is no more better than rmp
+// return -1 if lmp is less better than rmp
+// lmp		rmp
+// true		false	1
+// true		true	0
+// false	false	0
+// false	true	-1
+func cmpIfMatchPhysicalProp(lmp, rmp bool) int {
+	//fmt.Printf("lmp:%v, rmp:%v\n", lmp, rmp)
+	if lmp && !rmp {
+		return 1
+	}
+	if !lmp && rmp {
+		return -1
+	}
+	return 0
+}
+
+// isSingleScan is more better than double
+// return 1 if lss is more better than rss
+// return 0 if lss is no more better than rss
+// return -1 if lss is less better than rss
+// lss		rss
+// true		false	1
+// true		true	0
+// false	false	0
+// false	true	-1
+func cmpIfRequireDoubleScan(lss, rss bool) int {
+	//fmt.Printf("lss:%v, rss:%v\n", lss, rss)
+	if lss && !rss {
+		return 1
+	}
+	if !lss && rss {
+		return -1
+	}
+	return 0
+}
+
 // compareCandidates is the core of skyline pruning. It compares the two candidate paths on three dimensions:
 // (1): the set of columns that occurred in the access condition,
 // (2): whether or not it matches the physical property
 // (3): does it require a double scan.
 // If `x` is not worse than `y` at all factors,
 // and there exists one factor that `x` is better than `y`, then `x` is better than `y`.
+// x比y好，必须满足：
+// 1. 在所有因素上，x不必y差
+// 2. 存在某个因素，x要比y好
 func compareCandidates(lhs, rhs *candidatePath) int {
 	// TODO: implement the content according to the header comment.
-	return 0
+	columnSetRes, isSubset := ifSetOfColumnsInTheAccessCondition(lhs.columnSet, rhs.columnSet)
+	if !isSubset {
+		return 0
+	}
+
+	matchPropRes := cmpIfMatchPhysicalProp(lhs.isMatchProp, rhs.isMatchProp)
+
+	doubleScanRes := cmpIfRequireDoubleScan(lhs.isSingleScan, rhs.isSingleScan)
+
+	sum := columnSetRes + matchPropRes + doubleScanRes
+
+	cmp := 0
+
+	if sum > 0 {
+		if columnSetRes < 0 || matchPropRes < 0 || doubleScanRes < 0 {
+			cmp = 0
+		} else {
+			cmp = 1
+		}
+	}
+
+	if sum < 0 {
+		if columnSetRes > 0 || matchPropRes > 0 || doubleScanRes > 0 {
+			cmp = 0
+		} else {
+			cmp = -1
+		}
+	}
+
+	return cmp
 }
 
 func (ds *DataSource) getTableCandidate(path *util.AccessPath, prop *property.PhysicalProperty) *candidatePath {
@@ -248,6 +340,7 @@ func (ds *DataSource) getIndexCandidate(path *util.AccessPath, prop *property.Ph
 
 // skylinePruning prunes access paths according to different factors. An access path can be pruned only if
 // there exists a path that is not worse than it at all factors and there is at least one better factor.
+// 有比它更好的路径就可以裁剪
 func (ds *DataSource) skylinePruning(prop *property.PhysicalProperty) []*candidatePath {
 	candidates := make([]*candidatePath, 0, 4)
 	for _, path := range ds.possibleAccessPaths {
@@ -274,7 +367,27 @@ func (ds *DataSource) skylinePruning(prop *property.PhysicalProperty) []*candida
 		// TODO: Here is the pruning phase. Will prune the access path which is must worse than others.
 		//       You'll need to implement the content in function `compareCandidates`.
 		//       And use it to prune unnecessary paths.
-		candidates = append(candidates, currentCandidate)
+
+		ignore := false
+
+		for i := len(candidates) - 1; i >= 0; i-- {
+			// 对比candidates[i] 和 currentCandidate
+			// 如果cmp == 1，那么就认为i要比current要好，那么就没必要查其他path了
+			// 如果cmp == -1，那么就认为current要比i好，将i给踢掉保留current
+			cmp := compareCandidates(candidates[i], currentCandidate)
+			if cmp > 0 {
+				// c is better than current, so ignore current
+				ignore = true
+				break
+			} else if cmp < 0 {
+				// c is worse than current, so erase c
+				candidates = append(candidates[:i], candidates[i+1:]...)
+			}
+		}
+
+		if !ignore {
+			candidates = append(candidates, currentCandidate)
+		}
 	}
 	return candidates
 }

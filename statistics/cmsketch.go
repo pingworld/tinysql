@@ -1,4 +1,4 @@
-// Copyright 2017 PingCAP, Inc.
+﻿// Copyright 2017 PingCAP, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,8 +14,11 @@
 package statistics
 
 import (
+	"math"
 	"reflect"
+	"sort"
 
+	"github.com/cznic/sortutil"
 	"github.com/pingcap/errors"
 	"github.com/pingcap/tidb/sessionctx/stmtctx"
 	"github.com/pingcap/tidb/tablecodec"
@@ -24,12 +27,18 @@ import (
 	"github.com/spaolacci/murmur3"
 )
 
+// 我的理解
+// 有一堆的数据需要知道某个数据的个数，但又不能将所有数据都记下来，这时候就需要一种方法来估算个数。
+// 将无限的数据集合映射到有限的空间中，这就是hash的方式。
+// 为了能更好的避免hash冲突，将该值计算d个hash值，分别存到d行的空间中，在使用中，取d个值中最小作为count结果。
+// 这样可以确保统计值肯定比真实值大（因为hash存在冲突）但不会太过离谱（最小值）。
+
 // CMSketch is used to estimate point queries.
 // Refer: https://en.wikipedia.org/wiki/Count-min_sketch
 type CMSketch struct {
 	depth int32
 	width int32
-	count uint64
+	count uint64 // 所有统计项的个数
 	table [][]uint32
 }
 
@@ -50,6 +59,17 @@ func (c *CMSketch) InsertBytes(bytes []byte) {
 // insertBytesByCount adds the bytes value into the TopN (if value already in TopN) or CM Sketch by delta, this does not updates c.defaultValue.
 func (c *CMSketch) insertBytesByCount(bytes []byte, count uint64) {
 	// TODO: implement the insert method.
+
+	// 原理
+	// 1. 计算字节的hash值，由于`CMSketch:QueryBytes`使用了`murmur3.Sum128`，所以这里也是用`murmur3.Sum128`算法
+	// 2. cm 算法要求有d个不同的hash，bytes二维数组的每行都用一个hash计算得到具体的位置
+
+	h1, h2 := murmur3.Sum128(bytes)
+	c.count += count
+	for i := range c.table {
+		j := (h1 + h2*uint64(i)) % uint64(c.width)
+		c.table[i][j] += uint32(count)
+	}
 }
 
 func (c *CMSketch) queryValue(sc *stmtctx.StatementContext, val types.Datum) (uint64, error) {
@@ -66,9 +86,41 @@ func (c *CMSketch) QueryBytes(d []byte) uint64 {
 	return c.queryHashValue(h1, h2)
 }
 
+// 对于每一行 i，若 hash 函数映射到了值 j，那么用 (N - CM[i, j]) / (w-1)（N 是总共的插入的值数量）作为其他值产生的噪音，
+// 因此用 CM[i,j] - (N - CM[i, j]) / (w-1) 这一行的估计值，然后用所有行的估计值的中位数作为最后的估计值。
+// New Estimation Algorithms for Streaming Data: Count-min Can Do More
+func (c *CMSketch) amendHashValue(i, j int) (ret uint32) {
+	noise := (c.count - uint64(c.table[i][j])) / (uint64(c.width) - 1)
+
+	if uint64(c.table[i][j]) < noise {
+		return 0
+	}
+
+	return c.table[i][j] - uint32(noise)
+}
+
 func (c *CMSketch) queryHashValue(h1, h2 uint64) uint64 {
 	// TODO: implement the query method.
-	return uint64(0)
+	vals := make([]uint32, c.depth)
+
+	min := uint32(math.MaxUint32)
+	for i := range c.table {
+		j := (h1 + h2*uint64(i)) % uint64(c.width)
+		if min > c.table[i][j] {
+			min = c.table[i][j]
+		}
+
+		vals[i] = c.amendHashValue(i, int(j))
+	}
+
+	// get mid value of vals
+	sort.Sort(sortutil.Uint32Slice(vals))
+	res := vals[(c.depth-1)/2] + (vals[c.depth/2]-vals[(c.depth-1)/2])/2
+	if res > min {
+		res = min
+	}
+
+	return uint64(res)
 }
 
 // MergeCMSketch merges two CM Sketch.

@@ -1,4 +1,4 @@
-// Copyright 2017 PingCAP, Inc.
+﻿// Copyright 2017 PingCAP, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -45,6 +45,7 @@ func buildCMSketchAndMapWithOffset(d, w int32, seed int64, total, imax uint64, s
 		if err != nil {
 			return nil, nil, errors.Trace(err)
 		}
+		// 这是实际值，用来对比的cms的。
 		mp[val.GetInt64()]++
 	}
 	return cms, mp, nil
@@ -68,6 +69,8 @@ func averageAbsoluteError(cms *CMSketch, mp map[int64]uint32) (uint64, error) {
 		} else {
 			diff = estimate - uint64(count)
 		}
+		// 累计误差
+		// 当采样值越多，那么累计误差就越大
 		total += uint64(diff)
 	}
 	return total / uint64(len(mp)), nil
