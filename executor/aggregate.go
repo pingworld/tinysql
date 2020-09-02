@@ -1,4 +1,4 @@
-// Copyright 2016 PingCAP, Inc.
+﻿// Copyright 2016 PingCAP, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,6 +16,8 @@ package executor
 import (
 	"context"
 	"sync"
+
+	"github.com/spaolacci/murmur3"
 
 	"github.com/cznic/mathutil"
 	"github.com/pingcap/errors"
@@ -60,9 +62,9 @@ type HashAggPartialWorker struct {
 	outputChs         []chan *HashAggIntermData
 	globalOutputCh    chan *AfFinalResult
 	giveBackCh        chan<- *HashAggInput
-	partialResultsMap aggPartialResultMapper
+	partialResultsMap aggPartialResultMapper // 每个group-key对应的partial-result，没有group-key的话就是一个空的string
 	groupByItems      []expression.Expression
-	groupKey          [][]byte
+	groupKey          [][]byte // 这个为啥是二维数组呢？？因为是按chunk的行记录了每行的column
 	// chk stores the input data from child,
 	// and is reused by childExec and partial worker.
 	chk *chunk.Chunk
@@ -258,6 +260,8 @@ func (e *HashAggExec) initForParallelExec(ctx sessionctx.Context) {
 		}
 
 		e.partialWorkers[i] = w
+		// 为inputCh注入第一个chunk
+		// 为何每个partial线程都往inputCh中写入一个chk呢？
 		e.inputCh <- &HashAggInput{
 			chk:        newFirstChunk(e.children[0]),
 			giveBackCh: w.inputCh,
@@ -270,7 +274,7 @@ func (e *HashAggExec) initForParallelExec(ctx sessionctx.Context) {
 			baseHashAggWorker:   newBaseHashAggWorker(e.ctx, e.finishCh, e.FinalAggFuncs, e.maxChunkSize),
 			partialResultMap:    make(aggPartialResultMapper),
 			groupSet:            set.NewStringSet(),
-			inputCh:             e.partialOutputChs[i],
+			inputCh:             e.partialOutputChs[i], // final线程的输入就是partial线程的输出
 			outputCh:            e.finalOutputCh,
 			finalResultHolderCh: make(chan *chunk.Chunk, 1),
 			rowBuffer:           make([]types.Datum, 0, e.Schema().Len()),
@@ -320,6 +324,7 @@ func (w *HashAggPartialWorker) run(ctx sessionctx.Context, waitGroup *sync.WaitG
 			return
 		}
 		if err := w.updatePartialResult(ctx, sc, w.chk, len(w.partialResultsMap)); err != nil {
+			// 如果出错就直接返回给主线程
 			w.globalOutputCh <- &AfFinalResult{err: err}
 			return
 		}
@@ -330,17 +335,24 @@ func (w *HashAggPartialWorker) run(ctx sessionctx.Context, waitGroup *sync.WaitG
 }
 
 func (w *HashAggPartialWorker) updatePartialResult(ctx sessionctx.Context, sc *stmtctx.StatementContext, chk *chunk.Chunk, finalConcurrency int) (err error) {
+	// groupKey就是类似 group by xxx的column
+	// 为何这里需要groupKey呢？
 	w.groupKey, err = getGroupKey(w.ctx, chk, w.groupKey, w.groupByItems)
 	if err != nil {
 		return err
 	}
 
+	//"HashAggPartialWorker.updatePartialResult, w.groupKey:%d, %v\n", len(w.groupKey), w.groupKey
+
 	partialResults := w.getPartialResult(sc, w.groupKey, w.partialResultsMap)
 	numRows := chk.NumRows()
 	rows := make([]chunk.Row, 1)
+	// 这里的i并不是遍历的group-keys，为何？
+	// w.groupKey 这里是包含numRows的
 	for i := 0; i < numRows; i++ {
 		for j, af := range w.aggFuncs {
 			rows[0] = chk.GetRow(i)
+			// 这里才是针对每个agg计算并更新对应的partial result，每一行执行agg
 			if err = af.UpdatePartialResult(ctx, rows, partialResults[i][j]); err != nil {
 				return err
 			}
@@ -351,18 +363,46 @@ func (w *HashAggPartialWorker) updatePartialResult(ctx sessionctx.Context, sc *s
 
 // shuffleIntermData shuffles the intermediate data of partial workers to corresponded final workers.
 // We only support parallel execution for single-machine, so process of encode and decode can be skipped.
+// https://pingcap.com/blog-cn/tidb-source-code-reading-22/
+// shuffleIntermData 函数完成根据 Group 值 shuffle 给对应的 Final Worker。
+//
 func (w *HashAggPartialWorker) shuffleIntermData(sc *stmtctx.StatementContext, finalConcurrency int) {
-	// TODO: implement the method body. Shuffle the data to final workers.
+	groupKeysSlice := make([][]string, finalConcurrency)
+
+	// 随机应该也是可以的，将partial阶段的值传递给final，只是传递了group-key
+	for groupKey := range w.partialResultsMap {
+		finalWorkerIdx := int(murmur3.Sum32([]byte(groupKey))) % finalConcurrency
+		//"groupKey:%v, finalWorkerIdx:%d\n", groupKey, finalWorkerIdx
+
+		if groupKeysSlice[finalWorkerIdx] == nil {
+			groupKeysSlice[finalWorkerIdx] = make([]string, 0, len(w.partialResultsMap)/finalConcurrency)
+		}
+
+		groupKeysSlice[finalWorkerIdx] = append(groupKeysSlice[finalWorkerIdx], groupKey)
+	}
+
+	for i := range groupKeysSlice {
+		if groupKeysSlice[i] == nil {
+			continue
+		}
+
+		w.outputChs[i] <- &HashAggIntermData{
+			groupKeys:        groupKeysSlice[i],
+			partialResultMap: w.partialResultsMap, // 这里面其实包含了所有的gorup-key对应的partial结果
+		}
+	}
 }
 
 // getGroupKey evaluates the group items and args of aggregate functions.
 func getGroupKey(ctx sessionctx.Context, input *chunk.Chunk, groupKey [][]byte, groupByItems []expression.Expression) ([][]byte, error) {
-	numRows := input.NumRows()
+	numRows := input.NumRows() // chk有多少行
 	avlGroupKeyLen := mathutil.Min(len(groupKey), numRows)
 	for i := 0; i < avlGroupKeyLen; i++ {
 		groupKey[i] = groupKey[i][:0]
 	}
+	// 追加groupBy中的内容
 	for i := avlGroupKeyLen; i < numRows; i++ {
+		//"getGroupKey, append a empty key into groupKeys\n"
 		groupKey = append(groupKey, make([]byte, 0, 10*len(groupByItems)))
 	}
 
@@ -395,16 +435,19 @@ func getGroupKey(ctx sessionctx.Context, input *chunk.Chunk, groupKey [][]byte, 
 
 func (w baseHashAggWorker) getPartialResult(sc *stmtctx.StatementContext, groupKey [][]byte, mapper aggPartialResultMapper) [][]aggfuncs.PartialResult {
 	n := len(groupKey)
-	partialResults := make([][]aggfuncs.PartialResult, n)
+	partialResults := make([][]aggfuncs.PartialResult, n) // 每一个group-by都会有一个对应的PartialResult数组，数组中对应每个agg函数的值
 	for i := 0; i < n; i++ {
+		//"baseHashAggWorker.getPartialResult, i:%d, mapkey:%v, mapper:%v\n", i, len(string(groupKey[i])), len(mapper)
 		var ok bool
 		if partialResults[i], ok = mapper[string(groupKey[i])]; ok {
 			continue
 		}
 		for _, af := range w.aggFuncs {
+			// 这里只是分配了每个agg用到空间？
 			partialResults[i] = append(partialResults[i], af.AllocPartialResult())
 		}
 		mapper[string(groupKey[i])] = partialResults[i]
+		//"baseHashAggWorker.getPartialResult, i:%d, mapkey:%v, mapper:%v\n", i, len(string(groupKey[i])), len(mapper)
 	}
 	return partialResults
 }
@@ -413,7 +456,7 @@ func (w *HashAggFinalWorker) getPartialInput() (input *HashAggIntermData, ok boo
 	select {
 	case <-w.finishCh:
 		return nil, false
-	case input, ok = <-w.inputCh:
+	case input, ok = <-w.inputCh: // got from shuffleIntermData
 		if !ok {
 			return nil, false
 		}
@@ -421,9 +464,60 @@ func (w *HashAggFinalWorker) getPartialInput() (input *HashAggIntermData, ok boo
 	return
 }
 
+// 该函数调用 consumeIntermData 函数 接收 PartialWorkers 发送来的预聚合结果，进而 合并 得到最终结果
 func (w *HashAggFinalWorker) consumeIntermData(sctx sessionctx.Context) (err error) {
 	// TODO: implement the method body. This method consumes the data given by the partial workers.
-	return nil
+
+	var (
+		input            *HashAggIntermData
+		ok               bool
+		intermDataBuffer [][]aggfuncs.PartialResult
+		groupKeys        []string
+		sc               = sctx.GetSessionVars().StmtCtx
+	)
+
+	for {
+		// 1. 从partial阶段读取中间数据
+		if input, ok = w.getPartialInput(); !ok {
+			return nil
+		}
+
+		if intermDataBuffer == nil {
+			intermDataBuffer = make([][]aggfuncs.PartialResult, 0, w.maxChunkSize)
+		}
+
+		for reachEnd := false; !reachEnd; {
+			// 2. 批量读取中间数据
+			intermDataBuffer, groupKeys, reachEnd = input.getPartialResultBatch(sc, intermDataBuffer[:0], w.aggFuncs, w.maxChunkSize)
+
+			if len(groupKeys) == 0 {
+				continue
+			}
+
+			// 3. 处理group数据，原理就是将按groupkey拿到中间数据，然后合并，合并的时候是使用具体的聚合函数合并。
+			groupKeysLen := len(groupKeys)
+			w.groupKeys = w.groupKeys[:0]
+			for i := 0; i < groupKeysLen; i++ {
+				w.groupKeys = append(w.groupKeys, []byte(groupKeys[i]))
+			}
+
+			// partialResult 的数据结构要明确
+			// i - groupkey
+			// j - agg
+			finalPartialResults := w.getPartialResult(sc, w.groupKeys, w.partialResultMap)
+			for i, groupKey := range groupKeys {
+				if !w.groupSet.Exist(groupKey) {
+					w.groupSet.Insert(groupKey)
+				}
+				prs := intermDataBuffer[i]
+				for j, af := range w.aggFuncs {
+					if err = af.MergePartialResult(sctx, prs[j], finalPartialResults[i][j]); err != nil {
+						return err
+					}
+				}
+			}
+		}
+	}
 }
 
 func (w *HashAggFinalWorker) getFinalResult(sctx sessionctx.Context) {
@@ -431,13 +525,16 @@ func (w *HashAggFinalWorker) getFinalResult(sctx sessionctx.Context) {
 	if finished {
 		return
 	}
+	//1 getFinalResult, chk:%v, len(w.groupSet):%v\n", result, len(w.groupSet)
 	w.groupKeys = w.groupKeys[:0]
 	for groupKey := range w.groupSet {
+		//1.1 getFinalResult, groupKey:%v\n", groupKey
 		w.groupKeys = append(w.groupKeys, []byte(groupKey))
 	}
 	partialResults := w.getPartialResult(sctx.GetSessionVars().StmtCtx, w.groupKeys, w.partialResultMap)
 	for i := 0; i < len(w.groupSet); i++ {
 		for j, af := range w.aggFuncs {
+			//1.2 getFinalResult, j:%v, af:%v\n", j, af
 			if err := af.AppendFinalResult2Chunk(sctx, partialResults[i][j], result); err != nil {
 				logutil.BgLogger().Error("HashAggFinalWorker failed to append final result to Chunk", zap.Error(err))
 			}
@@ -453,6 +550,7 @@ func (w *HashAggFinalWorker) getFinalResult(sctx sessionctx.Context) {
 			}
 		}
 	}
+	//2 getFinalResult, chk:%v\n", result
 	w.outputCh <- &AfFinalResult{chk: result, giveBackCh: w.finalResultHolderCh}
 }
 
@@ -503,12 +601,17 @@ func (e *HashAggExec) fetchChildData(ctx context.Context) {
 		select {
 		case <-e.finishCh:
 			return
+			// 第一个数据从哪里来的？ 初始化partial线程的时候。
 		case input, ok = <-e.inputCh:
 			if !ok {
 				return
 			}
 			chk = input.chk
 		}
+		// 遍历子节点，取出每个Executor上的数据
+		// 由于每个partial线程都往这里加了一个chk，所以这里会触发多次，每次如果都读到一个chk的话，就会往对应的partial线程的
+		// giveBackCh中添加，这样自然就可以把本线程（fetch线程）读到的数据传递给对应的partial了。
+		// 这里的giveBackCh就是对应partial的w.inputCh线程。
 		err = Next(ctx, e.children[0], chk)
 		if err != nil {
 			e.finalOutputCh <- &AfFinalResult{err: err}
@@ -517,6 +620,7 @@ func (e *HashAggExec) fetchChildData(ctx context.Context) {
 		if chk.NumRows() == 0 {
 			return
 		}
+		// 将数据传递到
 		input.giveBackCh <- chk
 	}
 }
@@ -533,6 +637,7 @@ func (e *HashAggExec) waitFinalWorkerAndCloseFinalOutput(waitGroup *sync.WaitGro
 	close(e.finalOutputCh)
 }
 
+// partialModel
 func (e *HashAggExec) prepare4ParallelExec(ctx context.Context) {
 	go e.fetchChildData(ctx)
 
@@ -556,6 +661,10 @@ func (e *HashAggExec) prepare4ParallelExec(ctx context.Context) {
 // 1. input reader reads data from child executor and send them to partial workers.
 // 2. partial worker receives the input data, updates the partial results, and shuffle the partial results to the final workers.
 // 3. final worker receives partial results from all the partial workers, evaluates the final results and sends the final results to the main thread.
+// 原理：
+// 取数据 -- 交给M个partial线程处理成中间结果 -- 交给N个final线程得到最后的结果
+// partial线程有一个操作会将中间结果按group key混淆交给final线程，final线程会合并所有的中间结果得到最终的结果
+// 中间结果 -- 最终结果，是如何组织的？
 func (e *HashAggExec) parallelExec(ctx context.Context, chk *chunk.Chunk) error {
 	if !e.prepared {
 		e.prepare4ParallelExec(ctx)

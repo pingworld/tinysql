@@ -1,4 +1,4 @@
-// Copyright 2016 PingCAP, Inc.
+﻿// Copyright 2016 PingCAP, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -118,6 +118,11 @@ func (e *HashJoinExec) Open(ctx context.Context) error {
 	return nil
 }
 
+// 原理
+// select * from t left outer join t1 on t.c1 = t1.c1 and t.c1 != 1 order by t1.c1
+// inner side t1 (2,3),(4,4)
+// outer side t (1,1),(2,2)
+
 // Next implements the Executor Next interface.
 // hash join constructs the result following these steps:
 // step 1. fetch data from build side child and build a hash table;
@@ -154,6 +159,53 @@ func (e *HashJoinExec) fetchAndBuildHashTable(ctx context.Context) error {
 	// You'll need to store the hash table in `e.rowContainer`
 	// and you can call `newHashRowContainer` in `executor/hash_table.go` to build it.
 	// In this stage you can only assign value for `e.rowContainer` without changing any value of the `HashJoinExec`.
+
+	//1, featch and build hash table for inner executer, scheme:%v.\n", e.innerSideExec.Schema()
+
+	// read the data from inner side executor
+	innerFieldTypes := e.innerSideExec.base().retFieldTypes
+	innerSideList := chunk.NewList(innerFieldTypes, e.ctx.GetSessionVars().InitChunkSize, e.ctx.GetSessionVars().MaxChunkSize)
+
+	//1.1, fetch all chunks of inner executor.\n"
+
+	innerSideResult := make([]*chunk.Chunk, 0)
+	// read data from inner into result.
+	for {
+		// new a empty chunk.
+		chk := chunk.NewChunkWithCapacity(e.innerSideExec.base().retFieldTypes, e.ctx.GetSessionVars().MaxChunkSize)
+
+		// read chunk from executor
+		err := Next(ctx, e.innerSideExec, chk)
+		if err != nil {
+			return err
+		}
+
+		if chk.NumRows() == 0 {
+			break
+		}
+
+		innerSideResult = append(innerSideResult, chk)
+	}
+
+	//1.2, fetch key index of inner executor, innerKeys:%+v\n", e.innerKeys
+
+	innerKeyColIdx := make([]int, len(e.innerKeys))
+	for i := range e.innerKeys {
+		innerKeyColIdx[i] = e.innerKeys[i].Index
+	}
+	hCtx := &hashContext{
+		allTypes:  innerFieldTypes,
+		keyColIdx: innerKeyColIdx,
+	}
+
+	//1.3, build hash table, named rowContainer\n"
+
+	// build hash table
+	e.rowContainer = newHashRowContainer(e.ctx, int(e.innerSideEstCount), hCtx, innerSideList)
+	for _, chk := range innerSideResult {
+		_ = e.rowContainer.PutChunk(chk)
+	}
+
 	return nil
 }
 
@@ -240,6 +292,25 @@ func (e *HashJoinExec) fetchAndProbeHashTable(ctx context.Context) {
 	go util.WithRecovery(e.waitJoinWorkersAndCloseResultChan, nil)
 }
 
+// ONLY FOR DEBUGING
+//func printChk(chk *chunk.Chunk, ft []*types.FieldType, msg string) {
+//	fmt.Printf("%s chunk:%v\n", msg, chk)
+//
+//	iter := chunk.NewIterator4Chunk(chk.CopyConstruct())
+//	for row := iter.Begin(); row != iter.End(); row = iter.Next() {
+//		iRow := make([]string, row.Len())
+//		for j := 0; j < row.Len(); j++ {
+//			if row.IsNull(j) {
+//				iRow[j] = "<nil>"
+//			} else {
+//				d := row.GetDatum(j, ft[j])
+//				iRow[j], _ = d.ToString()
+//			}
+//			fmt.Printf("==> row:%v\n", iRow[j])
+//		}
+//	}
+//}
+
 func (e *HashJoinExec) runJoinWorker(workerID uint, outerKeyColIdx []int) {
 	// TODO: Implement the worker of probing stage.
 
@@ -248,8 +319,40 @@ func (e *HashJoinExec) runJoinWorker(workerID uint, outerKeyColIdx []int) {
 	// and put the `joinResult` into the channel `e.joinResultCh`.
 
 	// You may pay attention to:
-	// 
+	//
 	// - e.closeCh, this is a channel tells that the join can be terminated as soon as possible.
+
+	ok, joinResult := e.getNewJoinResult(workerID)
+	if !ok {
+		return
+	}
+
+	hCtx := &hashContext{
+		allTypes:  e.outerSideExec.base().retFieldTypes,
+		keyColIdx: outerKeyColIdx,
+	}
+
+	selected := make([]bool, 0, chunk.InitialCapacity)
+
+	for {
+		select {
+		case chk, ok := <-e.outerResultChs[workerID]:
+			if !ok {
+				return
+			}
+
+			ok, joinResult = e.join2Chunk(workerID, chk, hCtx, joinResult, selected)
+			if !ok {
+				return
+			}
+
+			if joinResult != nil {
+				e.joinResultCh <- joinResult
+			}
+		case <-e.closeCh:
+			return
+		}
+	}
 }
 
 func (e *HashJoinExec) getNewJoinResult(workerID uint) (bool, *hashjoinWorkerResult) {
