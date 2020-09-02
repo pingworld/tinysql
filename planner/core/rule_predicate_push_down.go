@@ -351,12 +351,100 @@ func (p *LogicalProjection) PredicatePushDown(predicates []expression.Expression
 	return append(remained, canNotBePushed...), child
 }
 
+// 只要在agg的列中就可以下推，否则不行
+func (la *LogicalAggregation) canScalarExprPushDown(schema *expression.Schema, expr expression.Expression) (
+	canPush bool, newExpre expression.Expression) {
+
+	colsInExpr := expression.ExtractColumns(expr)
+	if len(colsInExpr) == 0 {
+		return false, expr
+	}
+
+	for _, col := range colsInExpr {
+		if !schema.Contains(col) {
+			return false, expr
+		}
+	}
+
+	return true, expr
+}
+
+func (la *LogicalAggregation) DevidePushOrNotPush(predicates []expression.Expression) (
+	canNotPush, canBePush []expression.Expression) {
+	// 取groupBy中涉及到列
+	// expression.Schema 可以认为是一个保存列集合的结构
+	aggColumns := expression.NewSchema(la.groupByCols...)
+	if aggColumns.Len() == 0 {
+		// shouldn't be here!!
+		//log.Fatal("aggregation columns is empty.")
+		return
+	}
+
+	// 挨个查看每个谓词是否可以优化聚集函数
+	for _, cond := range predicates {
+		switch cond.(type) {
+		// 常量
+		case *expression.Constant:
+			canBePush = append(canBePush, cond)
+			canNotPush = append(canNotPush, cond)
+
+		// 表达式
+		case *expression.ScalarFunction:
+			if can, newExpr := la.canScalarExprPushDown(aggColumns, cond); can {
+				canBePush = append(canBePush, newExpr)
+			} else {
+				canNotPush = append(canNotPush, cond)
+			}
+
+		default:
+			// no rule to decide whether can be pushed... so pass throuth to baseLogicalPlan
+			canNotPush = append(canNotPush, cond)
+		}
+	}
+
+	return
+}
+
 // PredicatePushDown implements LogicalPlan PredicatePushDown interface.
 func (la *LogicalAggregation) PredicatePushDown(predicates []expression.Expression) (ret []expression.Expression, retPlan LogicalPlan) {
 	// TODO: Here you need to push the predicates across the aggregation.
-	//       A simple example is that `select * from (select count(*) from t group by b) tmp_t where b > 1` is the same with
+	//       A simple example is that
+	//       `select * from (select count(*) from t group by b) tmp_t where b > 1` is the same with
 	//       `select * from (select count(*) from t where b > 1 group by b) tmp_t.
-	return predicates, la
+
+	// 1. 过滤条件必须处于groupBy中，否则结果可能会错误，比如上面的例子，换成where c > 1，那么子查询中的结果可能就是这样了
+	/*
+		mysql> select * from (select c,count(*) from t where c>1 group by b) tmp_t;
+		+------+----------+
+		| c    | count(*) |
+		+------+----------+
+		|    2 |        1 |
+		|    2 |        1 |
+		|    4 |        2 |
+		+------+----------+
+		3 rows in set (0.00 sec)
+
+		mysql> select * from (select c,count(*) from t group by b) tmp_t where c > 1;
+		+------+----------+
+		| c    | count(*) |
+		+------+----------+
+		|    4 |        2 |
+		+------+----------+
+		1 row in set (0.00 sec)
+	*/
+
+	// 2. 否则都是可以下推的
+
+	// 无谓词可做下推处理，要返回baseLogicPlan
+	if len(predicates) == 0 {
+		return la.baseLogicalPlan.PredicatePushDown(predicates)
+	}
+
+	ret, canBePush := la.DevidePushOrNotPush(predicates)
+
+	la.baseLogicalPlan.PredicatePushDown(canBePush)
+
+	return ret, la
 }
 
 // PredicatePushDown implements LogicalPlan PredicatePushDown interface.

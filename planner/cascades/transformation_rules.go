@@ -1,4 +1,4 @@
-// Copyright 2018 PingCAP, Inc.
+﻿// Copyright 2018 PingCAP, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,6 +14,8 @@
 package cascades
 
 import (
+	"fmt"
+
 	"github.com/pingcap/tidb/expression"
 	"github.com/pingcap/tidb/expression/aggregation"
 	plannercore "github.com/pingcap/tidb/planner/core"
@@ -490,12 +492,80 @@ func NewRulePushSelDownAggregation() Transformation {
 	return rule
 }
 
+func (r *PushSelDownAggregation) appendGroup(curGroupExpr *memo.GroupExpr, childGroup *memo.Group) {
+	curGroupExpr.SetChildren(childGroup)
+}
+
+func (r *PushSelDownAggregation) newSelGroupExpr(root *plannercore.LogicalSelection,
+	exprs []expression.Expression) *memo.GroupExpr {
+	selPlan := plannercore.LogicalSelection{Conditions: exprs}.Init(root.SCtx())
+	return memo.NewGroupExpr(selPlan)
+}
+
+func (r *PushSelDownAggregation) pushDown(aggNode *memo.ExprIter, canBePushed, canNotBePushed []expression.Expression,
+	selPlan *plannercore.LogicalSelection, aggPlan *plannercore.LogicalAggregation) (newExprs []*memo.GroupExpr,
+	eraseOld bool, eraseAll bool, err error) {
+	// 1. 将可以下推的表达式放到一个新的LogicalSelection1中
+	// 2. 将不可以下推的表达式也放到一个新的LogicalSelection2中
+	// 3. 将这两个Plan跟aggPlan串联起来，组成 agg -> sel -> x 或者 sel -> agg -> sel -> x
+
+	aggChildGroup := aggNode.GetExpr().Children[0]
+
+	// make sel -> x
+	newSelGroupExpr := r.newSelGroupExpr(selPlan, canBePushed)
+	r.appendGroup(newSelGroupExpr, aggChildGroup)
+
+	// make agg -> sel
+	aggGroupExpr := memo.NewGroupExpr(aggPlan)
+	r.appendGroup(aggGroupExpr, memo.NewGroupWithSchema(newSelGroupExpr, aggChildGroup.Prop.Schema))
+
+	if len(canNotBePushed) == 0 {
+		return []*memo.GroupExpr{aggGroupExpr}, true, false, nil
+	}
+
+	// make sel -> agg -> sel -> x
+	remainSelGroupExpr := r.newSelGroupExpr(selPlan, canNotBePushed)
+	r.appendGroup(remainSelGroupExpr, memo.NewGroupWithSchema(aggGroupExpr, aggPlan.Schema()))
+
+	return []*memo.GroupExpr{remainSelGroupExpr}, true, false, nil
+}
+
+func (r *PushSelDownAggregation) getTransformFilters(plan *plannercore.LogicalSelection) []expression.Expression {
+	return plan.Conditions
+}
+
 // OnTransform implements Transformation interface.
 // It will transform `sel->agg->x` to `agg->sel->x` or `sel->agg->sel->x`
 // or just keep the selection unchanged.
 func (r *PushSelDownAggregation) OnTransform(old *memo.ExprIter) (newExprs []*memo.GroupExpr, eraseOld bool, eraseAll bool, err error) {
 	// TODO: implement the algo according to the header comment.
-	return []*memo.GroupExpr{old.GetExpr()}, false, false, nil
+
+	rootExpr := old.GetExpr()
+	rootExprEqualPlan, ok := rootExpr.ExprNode.(*plannercore.LogicalSelection)
+	if !ok {
+		return nil, false, false, fmt.Errorf("root node should be LogicalSelection")
+	}
+
+	predicates := r.getTransformFilters(rootExprEqualPlan)
+	// no conds need to push down.
+	if len(predicates) == 0 || len(old.Children) == 0 {
+		return nil, false, false, nil
+	}
+
+	// get child plan of root which should be LogicalAggregation
+	downNode := old.Children[0]
+	downPlan, ok := downNode.GetExpr().ExprNode.(*plannercore.LogicalAggregation)
+	if !ok {
+		return nil, false, false, fmt.Errorf("bottom node should be LogicalAggregation")
+	}
+
+	canNotBePushed, canBePushed := downPlan.DevidePushOrNotPush(predicates)
+	// no conds need to push down.
+	if len(canBePushed) == 0 {
+		return nil, false, false, nil
+	}
+
+	return r.pushDown(downNode, canBePushed, canNotBePushed, rootExprEqualPlan, downPlan)
 }
 
 // TransformLimitToTopN transforms Limit+Sort to TopN.
@@ -794,9 +864,77 @@ func (r *MergeAggregationProjection) Match(old *memo.ExprIter) bool {
 	return true
 }
 
+func assertLogicalAggregation(gExpr *memo.GroupExpr) (*plannercore.LogicalAggregation, error) {
+	plan, ok := gExpr.ExprNode.(*plannercore.LogicalAggregation)
+	if !ok {
+		return nil, fmt.Errorf("memo group node should be LogicalAggregation")
+	}
+	return plan, nil
+}
+
+func assertLogicalProjection(gExpr *memo.GroupExpr) (*plannercore.LogicalProjection, error) {
+	plan, ok := gExpr.ExprNode.(*plannercore.LogicalProjection)
+	if !ok {
+		return nil, fmt.Errorf("memo group node should be LogicalProjection")
+	}
+	return plan, nil
+}
+
 // OnTransform implements Transformation interface.
 // It will transform `Aggregation->Projection->X` to `Aggregation->X`.
 func (r *MergeAggregationProjection) OnTransform(old *memo.ExprIter) (newExprs []*memo.GroupExpr, eraseOld bool, eraseAll bool, err error) {
 	// TODO: implement the body according to the header comment.
-	return []*memo.GroupExpr{old.GetExpr()}, false, false, nil
+
+	// 原理
+	// 检查是否可以将投影和聚集合并，如果能将投影推到聚集之上，那么就可以减少Group中Expr的数量。
+	// e.g. select b, max(a) from (select a, c+d as b from t as t1) as t2 group by b
+	// aggPlan:
+	// 		GroupByItems:[Column#13]
+	// 		AggFuncs:[max(test.t.a) firstrow(Column#13)]
+	// projPlan:
+	//		[test.t.a plus(test.t.c, test.t.d)]
+	// transform:
+	//		[Column#13] -> plus(test.t.c, test.t.d) 意味着 `group by b` 可以替换成`group by c+d`
+
+	// get agg logic plan
+	rootAggPlan, err := assertLogicalAggregation(old.GetExpr())
+	if err != nil {
+		return nil, false, false, err
+	}
+
+	// get proj logic plan
+	nextProjNode := old.Children[0].GetExpr()
+	nextProjPlan, err := assertLogicalProjection(nextProjNode)
+	if err != nil {
+		return nil, false, false, err
+	}
+
+	// check whether cloumns in projection plan exists in groupby??
+	newGroupByItems := make([]expression.Expression, len(rootAggPlan.GroupByItems))
+
+	for i, item := range rootAggPlan.GroupByItems {
+		newGroupByItems[i] = expression.ColumnSubstitute(item, nextProjPlan.Schema(), nextProjPlan.Exprs)
+	}
+
+	// check whether cloumns in projection plan exists in aggFuncs??
+	newAggFuncs := make([]*aggregation.AggFuncDesc, len(rootAggPlan.AggFuncs))
+	for i, aggFunc := range rootAggPlan.AggFuncs {
+		newAggFuncs[i] = aggFunc.Clone()
+		newArgs := make([]expression.Expression, len(aggFunc.Args))
+		for j, arg := range aggFunc.Args {
+			newArgs[j] = expression.ColumnSubstitute(arg, nextProjPlan.Schema(), nextProjPlan.Exprs)
+		}
+		newAggFuncs[i].Args = newArgs
+	}
+
+	// build new aggregation plan
+	newAggExpr := memo.NewGroupExpr(plannercore.LogicalAggregation{
+		GroupByItems: newGroupByItems,
+		AggFuncs:     newAggFuncs,
+	}.Init(rootAggPlan.SCtx()))
+
+	// append the Children of old plan into new plan.
+	newAggExpr.SetChildren(nextProjNode.Children...)
+
+	return []*memo.GroupExpr{newAggExpr}, true, false, nil
 }
